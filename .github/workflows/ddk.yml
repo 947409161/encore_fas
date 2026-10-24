@@ -1,0 +1,95 @@
+name: DDK Build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ddk-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build ${{ matrix.kmi }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      # One broken KMI must not hide the result of the others.
+      fail-fast: false
+      matrix:
+        # Every KMI that the DDK publishes. The module also supports older
+        # kernels (4.14+), but DDK images only start at GKI 5.10.
+        kmi:
+          - android12-5.10
+          - android13-5.10
+          - android13-5.15
+          - android14-5.15
+          - android14-6.1
+          - android15-6.6
+          - android16-6.12
+          - android17-6.18
+
+    container:
+      # The image exports KDIR, ARCH=arm64, LLVM=1, CROSS_COMPILE and the
+      # matching Clang in PATH, which is exactly what kernel/Makefile expects.
+      image: ghcr.io/ylarod/ddk-min:${{ matrix.kmi }}
+      options: --privileged
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # The module version is the commit count (see kernel/Makefile), so
+          # the full history is needed for a meaningful FAS_VERSION.
+          fetch-depth: 0
+
+      - name: Trust the workspace
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Show toolchain
+        run: |
+          echo "KMI:    ${{ matrix.kmi }}"
+          echo "KDIR:   $KDIR"
+          echo "ARCH:   $ARCH"
+          echo "Cores:  $(nproc)"
+          clang --version | head -1
+          ld.lld --version
+
+      - name: Build module
+        run: make -C kernel -j"$(nproc)"
+
+      - name: Package
+        run: |
+          kmi="${{ matrix.kmi }}"
+          ko=kernel/encore_fas.ko
+
+          test -f "$ko" || { echo "::error::$ko was not produced"; exit 1; }
+
+          # GKI checksums change between vendor builds, so only the debug info
+          # is removed here; the symbols stay for the daemon to inspect.
+          llvm-strip -d "$ko"
+
+          machine=$(llvm-readelf -h "$ko" | awk -F: '/Machine/ { gsub(/^ +/, "", $2); print $2 }')
+          echo "Machine: $machine"
+          [ "$machine" = "AArch64" ] || { echo "::error::$ko is not an AArch64 module"; exit 1; }
+
+          vermagic=$(tr -c '[:print:]' '\n' < "$ko" | grep '^vermagic=' | head -1)
+          echo "Vermagic: $vermagic"
+
+          mkdir -p out
+          cp "$ko" "out/encore_fas-$kmi.ko"
+          echo "Size: $(du -h "out/encore_fas-$kmi.ko" | cut -f1)"
+          sha256sum "out/encore_fas-$kmi.ko"
+
+      - name: Upload module
+        uses: actions/upload-artifact@v4
+        with:
+          name: encore_fas-${{ matrix.kmi }}
+          path: out/encore_fas-${{ matrix.kmi }}.ko
+          if-no-files-found: error
+          retention-days: 14
