@@ -93,3 +93,53 @@ jobs:
           path: out/encore_fas-${{ matrix.kmi }}.ko
           if-no-files-found: error
           retention-days: 14
+
+  fas_ctl:
+    name: Build fas_ctl
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Locate NDK
+        id: ndk
+        run: |
+          # GitHub-hosted runners preinstall the NDK; the variable name has
+          # changed over time, so fall back to the newest tree in the SDK.
+          ndk="${ANDROID_NDK_HOME:-${ANDROID_NDK_LATEST_HOME:-}}"
+          if [ -z "$ndk" ] && [ -n "${ANDROID_HOME:-}" ]; then
+            ndk=$(ls -d "$ANDROID_HOME"/ndk/* 2>/dev/null | sort -V | tail -1)
+          fi
+          test -x "$ndk/ndk-build" || { echo "::error::no NDK found"; exit 1; }
+          echo "Using NDK: $ndk"
+          grep -h 'Pkg.Revision' "$ndk/source.properties" || true
+          echo "ndk=$ndk" >> "$GITHUB_OUTPUT"
+
+      - name: Build fas_ctl
+        env:
+          NDK: ${{ steps.ndk.outputs.ndk }}
+        run: |
+          # userspace_test is the ndk-build project root; jni/ holds the
+          # Android.mk. The --export-dynamic flag in Android.mk keeps
+          # fas_probe_frame in the dynamic symbol table for `selftest`.
+          cd userspace_test
+          "$NDK/ndk-build" NDK_PROJECT_PATH=. -j"$(nproc)"
+
+          bin=libs/arm64-v8a/fas_ctl
+          test -f "$bin" || { echo "::error::$bin was not produced"; exit 1; }
+
+          echo "Machine: $(readelf -h "$bin" | awk -F: '/Machine/ { gsub(/^ +/, "", $2); print $2 }')"
+          readelf --dyn-syms "$bin" | grep -q fas_probe_frame ||
+            { echo "::error::fas_probe_frame is not exported; selftest will fail"; exit 1; }
+          echo "Size: $(du -h "$bin" | cut -f1)"
+          sha256sum "$bin"
+
+      - name: Upload fas_ctl
+        uses: actions/upload-artifact@v4
+        with:
+          name: fas_ctl
+          path: userspace_test/libs/arm64-v8a/fas_ctl
+          if-no-files-found: error
+          retention-days: 14
